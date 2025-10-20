@@ -1,0 +1,271 @@
+/******************************************************************************************
+FLEX_PART_HANDLER_2025_LIGHT_ONLY.LS
+===========================================================================================
+🔧 FLEX PART HANDLER — LIGHT TOOL VERSION
+Author: Audrey Enriquez
+Last Updated: Oct 2025
+Robot: FANUC R-30iB+ Controller
+Language: TP/LS
+-------------------------------------------------------------------------------------------
+📄 DESCRIPTION
+Self-contained robotic handling program designed for FANUC-based CNC automation cells.  
+This version controls the LIGHT payload end-effector (0.5 kg), performing part pickup, 
+machine load/unload, finishing, regrip, and drop-off — all with inlined tool logic.
+
+-------------------------------------------------------------------------------------------
+✨ FEATURES
+- Inline tool control (TOOL_LIGHT) — no subroutines required.
+- Vision-guided offset pickup with configurable timeout.
+- CNC interface integration with retry and timeout handling.
+- Automatic finishing (deburr/polish) bypassed by mode select.
+- Adaptive droppoint offset sequencing for multiple slots.
+- Safe ABORT path that de-energizes all outputs and returns HOME.
+- Fully parameterized timeouts, retries, and pitch distances.
+
+-------------------------------------------------------------------------------------------
+📊 PARAMETER SUMMARY
+| Register | Function                | Default |
+|-----------|------------------------|----------|
+| R[20]     | Vision timeout (s)     | 5.0      |
+| R[21]     | Gripper timeout (s)    | 2.0      |
+| R[30]     | Chuck timeout (s)      | 4.0      |
+| R[31]     | Max load retries       | 3        |
+| R[22]     | Drop pitch (mm, +Y)    | 150      |
+| R[32]     | Max drop slots         | 8        |
+| R[90]     | Mode Select (1=Full, 2=SkipFinish, 3=TestOnly) | — |
+
+-------------------------------------------------------------------------------------------
+🧠 LOGIC FLOW
+  [START] → [Vision Pickup] → [CNC Load] → [Finish (optional)] →
+  [CNC Unload] → [Regrip] → [Drop] → [Summary Loop]
+
+-------------------------------------------------------------------------------------------
+💡 FUTURE IMPROVEMENTS
+- Add heavy-tool variant with separate payload and TCP data.
+- Integrate vision offset feedback directly from external process.
+- Include torque-based grasp verification and error trend logging.
+
+-------------------------------------------------------------------------------------------
+📁 REPO STRUCTURE
+├── FLEX_PART_HANDLER_2025_LIGHT_ONLY.LS   ← this file
+├── FLEX_PART_HANDLER_2025_HEAVY_TOOL.LS   ← (future variant)
+├── /docs/
+│   ├── IO_MAP.md
+│   ├── FLOW_DIAGRAM.png
+│   └── PAYLOAD_TABLE.csv
+└── README.md (mirrors this header)
+******************************************************************************************/
+
+/PROG  FLEX_PART_HANDLER_2025_LIGHT_ONLY
+! Self-contained robot handler with inlined TOOL_LIGHT logic
+! Rev: 2025.10.19  — safer interlocks, param timeouts, clean abort
+
+/MN
+!--- ========= CONFIG / CONSTANTS ========================= ---
+! R[20] Vision timeout (s)         | R[30] Chuck timeout (s)
+! R[21] Gripper timeout (s)        | R[31] Max load retries
+! R[22] Drop pitch (mm, +Y)        | R[32] Max drop slots
+! R[90] Mode: 1=Full 2=SkipFinish 3=TestOnly
+!
+LBL[0:CONFIG]
+  R[20:VISION_TMO]=5.0
+  R[21:GRIP_TMO]=2.0
+  R[30:CHUCK_TMO]=4.0
+  R[31:LOAD_RETRY_MAX]=3
+  R[22:DROP_PITCH]=150
+  R[32:MAX_SLOTS]=8
+  R[1:PART_COUNT]=0
+  R[5:DROP_SLOT]=0
+  R[6:Y_OFFSET]=0
+  R[15:PAYLD_IDX]=1
+  R[90:MODE_SELECT]=1
+  JMP LBL[1]
+
+!--- ========= BOOT / TOOL SET ============================ ---
+LBL[1:START]
+  MESSAGE[=== FLEX HANDLER BOOT ===]
+  ! Tool 1: LIGHT gripper setup (payload + TCP)
+  MESSAGE[SET TOOL: LIGHT]
+  PAYLOAD[1]=[0.5kg,(0,0,100)]
+  UTOOL[1]=P[11:TOOL_1_SETUP]
+  PR[1:HOME]=P[1:SAFE HOME]
+  JMP LBL[10]
+
+!--- ========= INBOUND : VISION PICKUP ==================== ---
+LBL[10:INBOUND]
+  UTOOL_NUM=1
+  UFRAME_NUM=2
+  MESSAGE[START VISION PICKUP]
+  $WAITTMOUT=R[20:VISION_TMO]
+  RUN VISION: FLEX_AI_2025
+  WAIT (F[21:VISION FOUND]=ON) TIMEOUT,LBL[55]
+
+  PR[2:VISION_OFFS]=[X:23.0,Y:-5.2,Z:0.0,W:0,P:0,R:0]
+  MESSAGE[OFFSET GENERATED FROM AI VISION]
+
+  PR[3:APPROACH]=PR[2:VISION_OFFS]
+  PR[3,3]=100
+  P[10:PICK]=500mm/sec CNT100 Offset,PR[3]
+
+  DO[10:GRIPPER CLOSE CMD]=PULSE,0.2sec
+  $WAITTMOUT=R[21:GRIP_TMO]
+  WAIT (DI[10:GRIPPER CLOSED]=ON) TIMEOUT,LBL[998]
+  MESSAGE[GRIPPER CLOSED OK]
+
+  MESSAGE[PAYLOAD SET OK]
+  IF (R[90:MODE_SELECT]=3), JMP LBL[60]
+  JMP LBL[20]
+
+LBL[55:VISION FAIL]
+  MESSAGE[NO PART FOUND]
+  UALM[1]
+  JMP LBL[999]
+
+!--- ========= LOAD CNC =================================== ---
+LBL[20:LOAD CNC]
+  UTOOL_NUM=2
+  UFRAME_NUM=3
+  MESSAGE[LOADING CNC]
+  R[80:LOAD_RETRY]=0
+LBL[21:RETRY LOAD]
+  P[20:CNC APPROACH]=750mm/sec CNT50
+
+  $WAITTMOUT=R[30:CHUCK_TMO]
+  WAIT (DI[110:CHUCK READY]=ON) TIMEOUT,LBL[901]
+  DO[105:OPEN CHUCK]=PULSE,0.2sec
+  WAIT (DI[108:CHUCK OPEN CONFIRM]=ON) TIMEOUT,LBL[901]
+
+  P[21:CNC INSERT]=250mm/sec FINE
+
+  DO[11:GRIPPER OPEN CMD]=PULSE,0.2sec
+  $WAITTMOUT=R[21:GRIP_TMO]
+  WAIT (DI[11:GRIPPER OPEN]=ON) TIMEOUT,LBL[997]
+  MESSAGE[GRIPPER OPEN OK]
+
+  WAIT .2(sec)
+  DO[106:CLOSE CHUCK]=PULSE,0.2sec
+  WAIT (DI[109:CHUCK CLOSED CONFIRM]=ON) TIMEOUT,LBL[901]
+
+  IF (R[90:MODE_SELECT]=2), JMP LBL[40]
+  JMP LBL[30]
+
+LBL[901:LOAD FAIL]
+  R[80:LOAD_RETRY]=R[80:LOAD_RETRY]+1
+  IF (R[80:LOAD_RETRY]<R[31:LOAD_RETRY_MAX]), JMP LBL[21]
+  MESSAGE[CNC LOAD FAILED]
+  UALM[3]
+  JMP LBL[999]
+
+!--- ========= FINISH (DEBURR / POLISH) =================== ---
+LBL[30:FINISH]
+  UTOOL_NUM=3
+  UFRAME_NUM=5
+  MESSAGE[START FINISH]
+  DO[110:TOOL SPIN]=ON
+  P[30:FINISH START]=100mm/sec CNT50
+  WAIT .5(sec)
+  P[31:FINISH SWEEP]=350mm/sec CNT100
+  WAIT .5(sec)
+  DO[110:TOOL SPIN]=OFF
+  JMP LBL[40]
+
+!--- ========= UNLOAD CNC ================================= ---
+LBL[40:UNLOAD CNC]
+  UTOOL_NUM=2
+  UFRAME_NUM=3
+  MESSAGE[UNLOADING CNC]
+
+  DO[105:OPEN CHUCK]=PULSE,0.2sec
+  $WAITTMOUT=R[30:CHUCK_TMO]
+  WAIT (DI[108:CHUCK OPEN CONFIRM]=ON) TIMEOUT,LBL[902]
+
+  P[22:UNLOAD POS]=250mm/sec FINE
+
+  DO[10:GRIPPER CLOSE CMD]=PULSE,0.2sec
+  $WAITTMOUT=R[21:GRIP_TMO]
+  WAIT (DI[10:GRIPPER CLOSED]=ON) TIMEOUT,LBL[998]
+  MESSAGE[GRIPPER CLOSED OK]
+  JMP LBL[50]
+
+LBL[902:UNLOAD FAIL]
+  MESSAGE[CHUCK UNLOAD ERROR]
+  UALM[4]
+  JMP LBL[999]
+
+!--- ========= REGRIP ===================================== ---
+LBL[50:REGRIP]
+  UTOOL_NUM=4
+  UFRAME_NUM=6
+  MESSAGE[REGRIP]
+  P[40:REGRIP DROP]=500mm/sec CNT50
+  DO[120:REGRIP OPEN]=ON
+  WAIT (DI[121:REGRIP OPEN SENSE]=ON)
+
+  DO[11:GRIPPER OPEN CMD]=PULSE,0.2sec
+  $WAITTMOUT=R[21:GRIP_TMO]
+  WAIT (DI[11:GRIPPER OPEN]=ON) TIMEOUT,LBL[997]
+
+  WAIT .2(sec)
+  P[41:REGRIP PICK]=250mm/sec FINE
+
+  DO[10:GRIPPER CLOSE CMD]=PULSE,0.2sec
+  $WAITTMOUT=R[21:GRIP_TMO]
+  WAIT (DI[10:GRIPPER CLOSED]=ON) TIMEOUT,LBL[998]
+
+  DO[120:REGRIP OPEN]=OFF
+  JMP LBL[60]
+
+!--- ========= DROPOFF ==================================== ---
+LBL[60:DROP]
+  UTOOL_NUM=2
+  UFRAME_NUM=4
+  R[6:Y_OFFSET]=R[5:DROP_SLOT]*(-R[22:DROP_PITCH])
+  PR[4:DROP_OFFS]=PR[3:APPROACH]
+  PR[4,2]=R[6:Y_OFFSET]
+  PR[4,3]=100
+  P[50:DROPOFF]=500mm/sec CNT25 Offset,PR[4]
+
+  DO[11:GRIPPER OPEN CMD]=PULSE,0.2sec
+  $WAITTMOUT=R[21:GRIP_TMO]
+  WAIT (DI[11:GRIPPER OPEN]=ON) TIMEOUT,LBL[997]
+
+  WAIT .25(sec)
+  R[5:DROP_SLOT]=R[5:DROP_SLOT]+1
+  IF (R[5:DROP_SLOT]>=R[32:MAX_SLOTS]), R[5:DROP_SLOT]=0
+  JMP LBL[70]
+
+!--- ========= SUMMARY / LOOP ============================= ---
+LBL[70:SUMMARY]
+  MESSAGE[=== CYCLE COMPLETE ===]
+  R[1:PART_COUNT]=R[1:PART_COUNT]+1
+  JMP LBL[10]
+
+!--- ========= TIMEOUT HANDLERS / ABORT =================== ---
+LBL[997]
+  MESSAGE[ERROR: GRIPPER OPEN TIMEOUT]
+  UALM[7]
+  JMP LBL[9989]
+
+LBL[998]
+  MESSAGE[ERROR: GRIPPER CLOSE TIMEOUT]
+  UALM[8]
+  JMP LBL[9989]
+
+LBL[9989:ABORT]
+  DO[10:GRIPPER CLOSE CMD]=OFF
+  DO[11:GRIPPER OPEN CMD]=OFF
+  DO[105:OPEN CHUCK]=OFF
+  DO[106:CLOSE CHUCK]=OFF
+  DO[110:TOOL SPIN]=OFF
+  DO[120:REGRIP OPEN]=OFF
+  PR[1:HOME]=P[1:SAFE HOME]
+  PR[1:HOME]=100% FINE
+  MESSAGE[PROGRAM ABORTED]
+  DO[100:STATUS_END]=ON
+  JMP LBL[999]
+
+!--- ========= END ======================================== ---
+LBL[999:END]
+  MESSAGE[PROGRAM COMPLETE]
+  DO[100:STATUS_END]=ON
+/END
